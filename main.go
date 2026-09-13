@@ -195,42 +195,35 @@ func nowTs() float64 {
 	return float64(time.Now().UnixNano()) / 1e9
 }
 
-// userTimeZone returns the timezone used to interpret "today" and other
-// date-only operations from the user's perspective. Configurable via
-// MCP_TIMEZONE (preferred) or TZ environment variables. Falls back to UTC.
+// wallClock and userTZ are package seams: tests pin the clock, and main() sets
+// userTZ from MCP_TIMEZONE/TZ via loadUserTimeZone.
 //
-// Why this matters: Things stores date-only fields (sr, tir, dd) as UTC
-// midnight of the calendar date. Determining what calendar date "today"
-// is must use the *user's* timezone — not the server's — otherwise users
-// in non-UTC zones get wrong-day results around midnight. Example: a
-// Berlin user (CEST = UTC+2) at 01:00 local on May 6 is at 23:00 UTC on
-// May 5; without TZ awareness, "today" would be computed as May 5 from
-// the server's UTC clock, even though the user clearly means May 6.
-//
-// The location is resolved on first call and cached; restart the server
-// after changing MCP_TIMEZONE.
+// Things stores date-only fields (sr, tir, dd) as UTC midnight of the calendar
+// date, but "today" is the user's calendar date. A Berlin user at 00:30 CEST is
+// already on the next day while the server's UTC clock is not.
 var (
-	userTZOnce sync.Once
-	userTZLoc  *time.Location
+	wallClock = time.Now
+	userTZ    = time.UTC
 )
 
-func userTimeZone() *time.Location {
-	userTZOnce.Do(func() {
-		for _, key := range []string{"MCP_TIMEZONE", "TZ"} {
-			if name := os.Getenv(key); name != "" {
-				if loc, err := time.LoadLocation(name); err == nil {
-					userTZLoc = loc
-					log.Printf("Date interpretation timezone: %s (from %s)", name, key)
-					return
-				} else {
-					log.Printf("Invalid %s=%q, ignoring: %v", key, name, err)
-				}
-			}
+// loadUserTimeZone resolves the zone that defines the user's "today" from
+// MCP_TIMEZONE, then TZ. Invalid or missing values fall back to UTC.
+func loadUserTimeZone(getenv func(string) string) *time.Location {
+	for _, key := range []string{"MCP_TIMEZONE", "TZ"} {
+		name := getenv(key)
+		if name == "" {
+			continue
 		}
-		userTZLoc = time.UTC
-		log.Printf("Date interpretation timezone: UTC (default; set MCP_TIMEZONE to override)")
-	})
-	return userTZLoc
+		loc, err := time.LoadLocation(name)
+		if err != nil {
+			log.Printf("Invalid %s=%q, ignoring: %v", key, name, err)
+			continue
+		}
+		log.Printf("Date interpretation timezone: %s (from %s)", name, key)
+		return loc
+	}
+	log.Printf("Date interpretation timezone: UTC (default; set MCP_TIMEZONE to override)")
+	return time.UTC
 }
 
 // todayMidnightUTC returns the UTC unix timestamp for the start of today's
@@ -238,8 +231,14 @@ func userTimeZone() *time.Location {
 // date-only fields as UTC midnight of the calendar date, so we keep the
 // UTC anchor but pick the calendar date from the user's perspective.
 func todayMidnightUTC() int64 {
-	now := time.Now().In(userTimeZone())
-	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Unix()
+	return userToday().Unix()
+}
+
+// userToday returns the user's current calendar date anchored at UTC midnight,
+// which is how Things stores date-only fields.
+func userToday() time.Time {
+	now := wallClock().In(userTZ)
+	return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +594,7 @@ func newTaskCreatePayload(title string, opts map[string]string, ix int) TaskCrea
 	var icsd *int64
 	if v, ok := opts["recurrence"]; ok && v != "" {
 		// Use schedule date as reference for weekday, fall back to today
-		recRef := time.Now()
+		recRef := userToday()
 		if schedStr, ok := opts["schedule"]; ok {
 			if dt := parseDate(schedStr); dt != nil {
 				recRef = *dt
@@ -639,7 +638,7 @@ func splitRecurringPayload(payload TaskCreatePayload) (string, TaskCreatePayload
 	if payload.Rr == nil {
 		return "", TaskCreatePayload{}, TaskCreatePayload{}, fmt.Errorf("recurrence rule is required")
 	}
-	reference := time.Now().UTC()
+	reference := userToday()
 	if payload.Tir != nil {
 		reference = time.Unix(*payload.Tir, 0).UTC()
 	} else if payload.Sr != nil {
@@ -858,15 +857,12 @@ func scheduleString(st thingscloud.TaskSchedule, scheduledDate *time.Time, start
 	}
 }
 
-// isToday returns true if t falls on today's calendar date in the user's
-// timezone. Both t and "now" are converted into the user's TZ before the
-// date components are compared, so the answer matches what the user sees
-// on their calendar — not what UTC says.
+// isToday reports whether the date-only value t falls on the user's current
+// calendar date. t is compared on its UTC calendar day: converting a stored
+// UTC-midnight date into a zone west of UTC would land on the previous day.
 func isToday(t time.Time) bool {
-	tz := userTimeZone()
-	tInTZ := t.In(tz)
-	now := time.Now().In(tz)
-	return tInTZ.Year() == now.Year() && tInTZ.Month() == now.Month() && tInTZ.Day() == now.Day()
+	u, today := t.UTC(), userToday()
+	return u.Year() == today.Year() && u.Month() == today.Month() && u.Day() == today.Day()
 }
 
 // effectiveScheduledDate returns the date Things uses for the visible
@@ -893,13 +889,9 @@ func isScheduledForTodayOrPast(task *thingscloud.Task) bool {
 	if date == nil {
 		return false
 	}
-	// Compute today's end in the user's timezone, then convert to UTC for
-	// comparison with the stored timestamp. This ensures a task scheduled
-	// for "today" stays in the Today filter until midnight in the user's
-	// view — not until midnight UTC, which can be hours off.
-	tz := userTimeZone()
-	now := time.Now().In(tz)
-	todayEnd := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, tz)
+	// Dates are UTC midnight of their calendar day, so today ends at 23:59:59
+	// UTC on the user's calendar date, not at 23:59:59 in the user's zone.
+	todayEnd := userToday().Add(24*time.Hour - time.Second)
 	return !date.After(todayEnd)
 }
 
@@ -3438,8 +3430,7 @@ func (t *ThingsMCP) handleOverview(_ context.Context, req mcp.CallToolRequest) (
 	// --- Today tasks ---
 	todaySet := make(map[string]bool)
 	var todayRaw []*thingscloud.Task
-	now := time.Now().UTC()
-	todayEnd := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, now.Location())
+	todayEnd := userToday().Add(24*time.Hour - time.Second)
 	cutoff := todayEnd.AddDate(0, 0, lookahead)
 
 	for _, task := range state.Tasks {
@@ -3963,7 +3954,7 @@ func (t *ThingsMCP) handleEditTask(_ context.Context, req mcp.CallToolRequest) (
 			}
 		} else {
 			// Add or change recurrence
-			recRef := time.Now()
+			recRef := userToday()
 			if schedStr := req.GetString("schedule", ""); schedStr != "" {
 				if dt := parseDate(schedStr); dt != nil {
 					recRef = *dt
@@ -4551,6 +4542,7 @@ func serveDiagReportPage(w http.ResponseWriter, reportJSON string) {
 // ---------------------------------------------------------------------------
 
 func main() {
+	userTZ = loadUserTimeZone(os.Getenv)
 	log.SetFlags(log.Ltime | log.Lmsgprefix)
 	log.SetPrefix("[things-mcp] ")
 	proxyURLs := parseProxyURLs(os.Getenv("PROXY_URLS"))
